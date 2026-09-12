@@ -73,7 +73,7 @@ The SaveSync script checks for a network connection before attempting synchroniz
 
 ---
 
-# 1. Prepare the Windows PC
+# 1. Set Up The Host
 
 ## Create the SaveSync Folder
 
@@ -91,7 +91,7 @@ Do **not** create a separate folder for each R36S. A single shared SaveSync fold
 
 ---
 
-## Share the Folder
+## Share the Folder (SMB is used as an example)
 
 Right-click the folder and share it over your local network.
 
@@ -298,34 +298,15 @@ SaveSync will reject the configuration if the value is missing or contains anyth
 
 ---
 
-# 4. Configure SaveSync on the Console
-
-Open:
-
-**RetroArch Manager → SaveSync**
-
-The SaveSync menu contains:
-
-1. **Install SaveSync**
-2. **Enter Credentials**
-3. **Synchronize Now**
-4. **View Log**
-
-After installation, the first menu item changes to:
-
-**Uninstall SaveSync**
-
----
-
-# 5. Install SaveSync
+# 4. Install SaveSync
 
 Select:
 
 **Install SaveSync**
 
-The installer automatically checks for the required CIFS support.
+The installer automatically checks for the required protocol support.
 
-If `mount.cifs` is not installed, RetroArch Manager attempts to install the required `cifs-utils` package automatically.
+If required dependencies are not installed, SaveSync Manager attempts to install them automatically.
 
 SaveSync then installs:
 
@@ -337,7 +318,7 @@ and configures the automatic synchronization components.
 
 ---
 
-# 6. Enter Network Credentials
+# 5. Enter Network Credentials
 
 Select:
 
@@ -345,14 +326,14 @@ Select:
 
 You will be able to configure:
 
-* **NetBIOS or IP**
+* **Host or IP**
 * **Username**
 * **Password**
 * **Network Path**
 
 ---
 
-## NetBIOS or IP
+## Host or IP
 
 You can enter either the Windows computer's network name:
 
@@ -380,7 +361,7 @@ If using an IP address, it is recommended to give the PC a DHCP reservation in y
 
 ## Username
 
-Enter the Windows account username that has permission to access the shared SaveSync folder.
+Enter the account username that has permission to access the shared SaveSync folder.
 
 For example:
 
@@ -392,7 +373,7 @@ John
 
 ## Password
 
-Enter the password for that Windows account.
+Enter the password for that network account.
 
 SaveSync stores the credentials in:
 
@@ -406,7 +387,7 @@ The credentials file is created with restrictive permissions (`600`) so it is no
 
 ## Network Path
 
-Enter the **SMB share name**, not the Windows filesystem path.
+Enter the **share name**, not the Windows filesystem path.
 
 If the Windows share is:
 
@@ -442,9 +423,9 @@ and mounts it using SMB 3.0.
 
 ---
 
-# 7. Perform the First Synchronization
+# 6. Perform the First Synchronization
 
-Once the Windows share and credentials are configured, select:
+Once the network protocol and credentials are configured, select:
 
 **SaveSync → Synchronize Now**
 
@@ -470,7 +451,7 @@ If the synchronization fails, the most recent SaveSync error is displayed when a
 
 ---
 
-# 8. Automatic Synchronization
+# 7. Automatic Synchronization
 
 Once SaveSync is installed, synchronization happens automatically.
 
@@ -518,7 +499,7 @@ Use this whenever you want to force an immediate synchronization without rebooti
 
 ---
 
-# 9. Using Multiple R36S Devices
+# 8. Using Multiple R36S Devices
 
 One of the major advantages of SaveSync is that multiple R36S devices can use the same Windows share.
 
@@ -552,7 +533,7 @@ This allows you to move between devices while keeping your game progress synchro
 
 ---
 
-# 10. Important: How Synchronization Handles Files
+# 9. Important: How Synchronization Handles Files
 
 SaveSync is **bidirectional**.
 
@@ -604,9 +585,9 @@ This makes it possible to continue playing the same games on multiple R36S devic
 
 ---
 
-# 11. RetroArch Save Locations
+# 10. RetroArch Save Locations
 
-SaveSync supports both  RetroArch Manager save arrangements.
+SaveSync supports both RetroArch Manager save arrangements.
 
 ### Centralized saves
 
@@ -658,7 +639,7 @@ and uses the corresponding system directory.
 
 ---
 
-# 12. Checking the SaveSync Log
+# 11. Checking the SaveSync Log
 
 SaveSync maintains a log at:
 
@@ -686,7 +667,7 @@ Sync complete, unmounted /mnt/savesync
 
 ---
 
-# 13. Troubleshooting
+# 12. Troubleshooting
 
 ## "No network connection detected"
 
@@ -710,8 +691,8 @@ authentication failed
 
 check:
 
-* Windows username
-* Windows password
+* Username
+* Password
 * Share permissions
 * File/folder permissions
 
@@ -831,7 +812,7 @@ USECONTENTFOLDER=false
 
 ---
 
-# 14. Uninstalling SaveSync
+# 13. Uninstalling SaveSync
 
 To remove SaveSync:
 
@@ -857,7 +838,7 @@ Your Windows SaveSync folder and its contents are **not** removed.
 
 ---
 
-# 15. Recommended Setup
+# 14. Recommended Setup
 
 For most users, the following configuration is recommended:
 
@@ -887,7 +868,7 @@ USECONTENTFOLDER=false
 Configure:
 
 ```text
-NetBIOS/IP:    <Windows PC IP or name>
+Host:          <Windows PC IP or name>
 Username:      <Windows username>
 Password:      <Windows password>
 Network Path:  SaveSync
@@ -904,27 +885,3 @@ Then:
 After that, SaveSync handles synchronization automatically at boot and after games are exited.
 
 ---
-
-# 16. Summary
-
-SaveSync provides a simple way to keep R36S game saves synchronized across devices without manually copying files.
-
-Once configured:
-
-```text
-Play game
-    ↓
-Exit game
-    ↓
-SaveSync automatically runs
-    ↓
-Windows share is mounted
-    ↓
-Saves synchronize in both directions
-    ↓
-Share is unmounted
-```
-
-The same process also occurs during boot once the network is available.
-
-The result is a persistent network-based save repository that can be shared by multiple R36S devices, making it much easier to protect game progress and continue playing on another device.
