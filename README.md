@@ -1,16 +1,12 @@
 [<img width="200" height="67" alt="ChatGPT Image Aug 12, 2026, 02_04_12 PM" img align="right"  src="https://github.com/user-attachments/assets/7eb7b583-5d57-4884-ae90-ad7127d733c4" alt="Right aligned" />](https://ko-fi.com/O8Z424G15Y)
 # SaveSync (with RetroArch Manager)
-A script to manage gamesave locations and automatically synchronize them over various local networking protocols. SaveSync does not require an account or subscription, everything is managed locally on the host device.
+SaveSync is an automated service that automatically synchronizes RetroArch and standalone emulator game saves between your R36 device and a shared folder on a PC over your local network. SaveSync does not require an account or subscription, everything is managed locally on the host device.
 
 ### Supported Protocols (thanks to @lcdyk)
 - SMB
 - NFS
 - SSHFS
 - WebDAV
-
-# SaveSync
-
-SaveSync is an automated service that automatically synchronizes RetroArch and standalone emulator game saves between your R36 device and a shared folder on a Windows PC over your local network.
 
 It is designed to keep your saves synchronized without requiring you to manually copy them. Once configured, SaveSync can synchronize saves:
 
