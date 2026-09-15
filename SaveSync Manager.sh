@@ -1953,9 +1953,9 @@ Main_Menu() {
 			"1" "$installed" \
 			"2" "$T_MANUAL" \
 			"3" "$T_CACHE" \
-			"4" "$fastsync" \
-			"5" "$T_CRED" \
-			"6" "$T_PROTOCOL" \
+			"4" "$T_CRED" \
+			"5" "$T_PROTOCOL" \
+			"6" "$fastsync" \
 			"7" "$T_LOG_TITLE" \
 			"8" "$T_SAVE_LOCATION" \
             2>&1 > "$CURR_TTY")
@@ -1970,13 +1970,13 @@ Main_Menu() {
 					fi ;;
 				2) Manual_Sync ;;
 				3) "$SYNC_SCRIPT" --scan ;;
-				4) if [[ -f "$FS_FLAG" ]]; then
+				4) Credentials_Menu ;;
+				5) Protocol_Menu ;;
+				6) if [[ -f "$FS_FLAG" ]]; then
 						rm -f "$FS_FLAG"
 					else
 						touch "$FS_FLAG"
 					fi ;;
-				5) Credentials_Menu ;;
-				6) Protocol_Menu ;;
 				7) Log_Menu ;;
 				8) Location_Menu
 			esac
