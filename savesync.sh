@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+trap 'echo "$(date "+%Y-%m-%d %H:%M:%S") - CRASH: line $LINENO, exit $?, cmd: $BASH_COMMAND" >> /home/ark/.config/savesync.log' ERR
 
 declare -A LOCAL_SAVE_MTIME
 declare -A LOCAL_MCR_MTIME
@@ -13,11 +14,37 @@ if [ "$(id -u)" -ne 0 ]; then
     exec sudo -- "$0" "$@"
 fi
 
+# --- Argument handling ---
+GAME_END_SYSTEM=""
+
+if [ "${1:-}" = "--game-end" ]; then
+    GAME_END_SYSTEM="${2:-}"
+
+    if [ -z "$GAME_END_SYSTEM" ]; then
+        log "ERROR: --game-end requires a system name"
+        exit 1
+    fi
+fi
+
 # --- Self-background ---
 if [ "${1:-}" != "--bg" ] && [ "${1:-}" != "--scan" ]; then
-    nohup "$0" --bg >/dev/null 2>&1 &
+    if [ "${1:-}" = "--game-end" ]; then
+        nohup "$0" --bg --game-end "$GAME_END_SYSTEM" >/dev/null 2>&1 &
+    else
+        nohup "$0" --bg >>/home/ark/.config/savesync.log 2>&1 &
+    fi
     disown
     exit 0
+fi
+
+# Recover game-end argument after self-backgrounding.
+if [ "${2:-}" = "--game-end" ]; then
+    GAME_END_SYSTEM="${3:-}"
+
+    if [ -z "$GAME_END_SYSTEM" ]; then
+        log "ERROR: --game-end requires a system name"
+        exit 1
+    fi
 fi
 
 # --- Constants ---
@@ -30,7 +57,8 @@ RA32_SAVES="/home/ark/.config/retroarch32/saves"
 MOUNT_POINT="/mnt/savesync"
 PC_CFG_NAME="savesync.cfg"
 CACHE_FILE="/home/ark/.config/savesync.cache"
-
+MTIME_CACHE_FILE="$MOUNT_POINT/mtime.cache"
+FASTSYNC_FILE="/home/ark/.config/.fastsync"
 MEDNAFEN_SYSTEMS="lynx wonderswancolor pcengine pcenginecd nes gb snes gbc gba mastersystem megadrive gamegear ngp ngpc"
 
 STANDALONE_PATHS=(
@@ -42,11 +70,9 @@ STANDALONE_PATHS=(
     "/roms/saturn|*.srm"
 )
 
-
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$LOG_FILE"
 }
-
 
 scan_systems() {
     local system file paths=() s
@@ -64,10 +90,14 @@ scan_systems() {
     while IFS='|' read -r system location ra64 ra32; do
         [ -n "$system" ] && [ -n "$location" ] || continue
 
+		if [ ! -d "$location/$system" ]; then
+			continue
+		fi
+
         hit=$(find "$location/$system" -mindepth 1 -maxdepth 2 -type f \
               \( "${find_args[@]}" \) -print -quit 2>/dev/null)
 
-        [ -n "$hit" ] && printf '%s|%s\n' "$system" "$location" >> "$CACHE_FILE"
+        [ -n "$hit" ] && printf 'SYSTEM|%s|%s\n' "$system" "$location" >> "$CACHE_FILE"
     done < <(awk '
         /<system>/ { name=""; path=""; ra64=0; ra32=0; in_emulators=0 }
         /<name>/ && name=="" { name=$0; sub(/.*<name>/, "", name); sub(/<\/name>.*/, "", name) }
@@ -87,156 +117,321 @@ scan_systems() {
     ' "$ES_SYSTEMS")
 }
 
-build_remote_mtime_cache() {
-    local record path mtime rel system file maxdepth paths=() s
+standalone_cache_entries()
+{
+    local entry system location
 
-    REMOTE_SAVE_MTIME=()
-    REMOTE_MCR_MTIME=()
-	REMOTE_STANDALONE_MTIME=()
-	
-    if [ "$USECONTENTFOLDER" = "true" ]; then
-        maxdepth=3
-    else
-        maxdepth=2
-    fi
-
-    for s in "${!SYSTEM_CACHE[@]}"; do
-        paths+=("$MOUNT_POINT/$s")
+    for entry in "${STANDALONE_PATHS[@]}"; do
+        printf '%s\n' "$entry"
     done
 
-    if [ "${#paths[@]}" -eq 0 ]; then
-        return 0
-    fi
-
-    while IFS= read -r -d '' record; do
-        mtime="${record%% *}"
-        path="${record#* }"
-
-        rel="${path#"$MOUNT_POINT"/}"
-
-        [[ "$rel" == */* ]] || continue
-
-        system="${rel%%/*}"
-        [ -n "$system" ] || continue
-
-        file="${rel#*/}"
-
-        # Normal saves must be directly inside the system directory,
-        # or inside system/system when content-folder mode is enabled.
-        if [ "$USECONTENTFOLDER" = "false" ]; then
-            [[ "$file" != */* ]] || continue
-        else
-            [[ "$file" == "$system/"* ]] || continue
-            file="${file#*/}"
-            [[ "$file" != */* ]] || continue
+    for system in "${!SYSTEM_CACHE[@]}"; do
+        if [[ " $MEDNAFEN_SYSTEMS " == *" $system "* ]]; then
+            location="${SYSTEM_CACHE[$system]}"
+            [[ -n "$location" ]] || continue
+            printf '%s|*.mcr\n' "$location/$system"
         fi
-
-        mtime="${mtime%.*}"
-
-		if [[ "$file" == *.mcr ]]; then
-			if (( ${REMOTE_MCR_MTIME[$system]:-0} < mtime )); then
-				REMOTE_MCR_MTIME["$system"]="$mtime"
-			fi
-
-		elif [[ "$file" == *.srm || "$file" == *.sav || "$file" == *.state* ]]; then
-			if (( ${REMOTE_SAVE_MTIME[$system]:-0} < mtime )); then
-				REMOTE_SAVE_MTIME["$system"]="$mtime"
-			fi
-
-		elif [[ "$file" == *.sra || "$file" == *.eep || "$file" == *.fla ]]; then
-			if (( ${REMOTE_STANDALONE_MTIME["$system|*.sra *.eep *.fla"]:-0} < mtime )); then
-				REMOTE_STANDALONE_MTIME["$system|*.sra *.eep *.fla"]="$mtime"
-			fi
-
-		elif [[ "$file" == *.dsv ]]; then
-			if (( ${REMOTE_STANDALONE_MTIME["$system|*.dsv"]:-0} < mtime )); then
-				REMOTE_STANDALONE_MTIME["$system|*.dsv"]="$mtime"
-			fi
-
-		elif [[ "$file" == *.ppst ]]; then
-			if (( ${REMOTE_STANDALONE_MTIME["$system|*.ppst"]:-0} < mtime )); then
-				REMOTE_STANDALONE_MTIME["$system|*.ppst"]="$mtime"
-			fi
-		fi
-    done < <(
-        find "${paths[@]}" \
-            -mindepth 1 \
-            -maxdepth "$((maxdepth - 1))" \
-			-type f \
-            \( -name '*.srm' -o -name '*.sav' -o -name '*.state*' -o -name '*.mcr' \) \
-            -printf '%T@ %p\0'
-    )
+    done
 }
 
-build_local_mtime_cache() {
-    local record path mtime rel system file current
+build_remote_mtime_cache()
+{
+    REMOTE_SAVE_MTIME=()
+    REMOTE_MCR_MTIME=()
+    REMOTE_STANDALONE_MTIME=()
+	local today
+	local cache_date
+	local entry path patterns key latest rel dst
+	local system
+	local pat m
+	local -a find_args
 
+    today=$(date +%F)
+
+    # FastSync: today's mtime.cache is authoritative.
+    if [[ -f "$FASTSYNC_FILE" && -f "$MTIME_CACHE_FILE" ]]; then
+        cache_date=$(awk -F'|' '$1=="DATE"{print $2; exit}' "$MTIME_CACHE_FILE")
+
+        if [[ "$cache_date" == "$today" ]]; then
+            while IFS='|' read -r type key1 key2 val; do
+                case "$type" in
+                    SAVE) REMOTE_SAVE_MTIME["$key1"]="$val" ;;
+                    MCR)  REMOTE_MCR_MTIME["$key1"]="$val" ;;
+                    SA)   REMOTE_STANDALONE_MTIME["$key1|$key2"]="$val" ;;
+                esac
+            done < "$MTIME_CACHE_FILE"
+
+            return 0
+        fi
+    fi
+
+    log "Building remote mtime cache..."
+
+    # Normal saves.
+    while IFS= read -r file; do
+        [[ -f "$file" ]] || continue
+
+        system=$(basename "$(dirname "$file")")
+        mtime=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+        [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+
+        if [[ "$file" == *.mcr ]]; then
+            REMOTE_MCR_MTIME["$system"]="${REMOTE_MCR_MTIME[$system]:-0}"
+            (( mtime > REMOTE_MCR_MTIME["$system"] )) &&
+                REMOTE_MCR_MTIME["$system"]="$mtime"
+        else
+            REMOTE_SAVE_MTIME["$system"]="${REMOTE_SAVE_MTIME[$system]:-0}"
+            (( mtime > REMOTE_SAVE_MTIME["$system"] )) &&
+                REMOTE_SAVE_MTIME["$system"]="$mtime"
+        fi
+    done < <(
+        find "$MOUNT_POINT" \
+            -type f \
+            \( -name '*.srm' -o -name '*.sav' -o -name '*.state*' -o -name '*.mcr' \) \
+            2>/dev/null
+    )
+
+    # All standalone locations.
+
+    while IFS= read -r entry; do
+        path="${entry%%|*}"
+        patterns="${entry#*|}"
+        key="$path|$patterns"
+        latest=0
+
+        rel="${path#/roms2/}"
+        rel="${rel#/roms/}"
+        dst="$MOUNT_POINT/$rel"
+
+        if [[ -d "$dst" ]]; then
+            if [[ -n "$patterns" ]]; then
+                find_args=()
+                for pat in $patterns; do
+                    find_args+=( -name "$pat" -o )
+                done
+                unset 'find_args[${#find_args[@]}-1]'
+
+                while IFS= read -r file; do
+                    [[ -f "$file" ]] || continue
+                    m=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+                    [[ "$m" =~ ^[0-9]+$ ]] || m=0
+                    (( m > latest )) && latest=$m
+                done < <(find "$dst" -type f \( "${find_args[@]}" \) 2>/dev/null)
+            else
+                while IFS= read -r file; do
+                    [[ -f "$file" ]] || continue
+                    m=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+                    [[ "$m" =~ ^[0-9]+$ ]] || m=0
+                    (( m > latest )) && latest=$m
+                done < <(find "$dst" -type f 2>/dev/null)
+            fi
+        fi
+
+        REMOTE_STANDALONE_MTIME["$key"]="$latest"
+    done < <(standalone_cache_entries)
+
+    # FastSync persists the complete remote cache.
+    if [[ -f "$FASTSYNC_FILE" ]]; then
+        {
+            printf 'DATE|%s\n' "$today"
+
+            for system in "${!REMOTE_SAVE_MTIME[@]}"; do
+                printf 'SAVE|%s||%s\n' "$system" "${REMOTE_SAVE_MTIME[$system]}"
+            done
+
+            for system in "${!REMOTE_MCR_MTIME[@]}"; do
+                printf 'MCR|%s||%s\n' "$system" "${REMOTE_MCR_MTIME[$system]}"
+            done
+
+            for key in "${!REMOTE_STANDALONE_MTIME[@]}"; do
+                IFS='|' read -r path patterns <<< "$key"
+                printf 'SA|%s|%s|%s\n' "$path" "$patterns" "${REMOTE_STANDALONE_MTIME[$key]}"
+            done
+        } > "${MTIME_CACHE_FILE}.tmp"
+
+        mv -f "${MTIME_CACHE_FILE}.tmp" "$MTIME_CACHE_FILE"
+    fi
+}
+
+build_local_mtime_cache()
+{
     LOCAL_SAVE_MTIME=()
     LOCAL_MCR_MTIME=()
     LOCAL_STANDALONE_MTIME=()
+    local tmp_cache
+    local entry path patterns key latest
+    local system location
+    local pat m
+    local -a find_args
+    local today cache_date
 
-    # Normal RetroArch saves
-    while IFS= read -r -d '' record; do
-        mtime="${record%% *}"
-        path="${record#* }"
+    today=$(date +%F)
 
-        rel="${path#/roms2/}"
-        system="${rel%%/*}"
+    # Existing local cache is valid only for the current day.
+    if [[ -f "$FASTSYNC_FILE" && -f "$CACHE_FILE" ]]; then
+        cache_date=$(awk -F'|' '$1=="DATE"{print $2; exit}' "$CACHE_FILE" 2>/dev/null || true)
 
-        [ -n "$system" ] || continue
+        if [[ "$cache_date" == "$today" ]]; then
+            while IFS='|' read -r type key1 key2 val; do
+                case "$type" in
+                    SYSTEM)
+                        SYSTEM_CACHE["$key1"]="$key2"
+                        ;;
+                    SAVE)
+                        LOCAL_SAVE_MTIME["$key1"]="$val"
+                        ;;
+                    MCR)
+                        LOCAL_MCR_MTIME["$key1"]="$val"
+                        ;;
+                    SA)
+                        LOCAL_STANDALONE_MTIME["$key1|$key2"]="$val"
+                        ;;
+                esac
+            done < "$CACHE_FILE"
 
-        file="${rel#*/}"
-
-        [[ "$file" == "$system/"* ]] || continue
-        file="${file#*/}"
-        [[ "$file" != */* ]] || continue
-
-        mtime="${mtime%.*}"
-
-        if [[ "$file" == *.mcr ]]; then
-            current="${LOCAL_MCR_MTIME[$system]-0}"
-            (( current < mtime )) && LOCAL_MCR_MTIME["$system"]="$mtime"
-        elif [[ "$file" == *.srm || "$file" == *.sav || "$file" == *.state* ]]; then
-            current="${LOCAL_SAVE_MTIME[$system]-0}"
-            (( current < mtime )) && LOCAL_SAVE_MTIME["$system"]="$mtime"
+            return 0
         fi
-    done < <(
-        find /roms2 \
-            -mindepth 3 -maxdepth 3 \
-            \( -name '*.srm' -o -name '*.sav' -o -name '*.state*' -o -name '*.mcr' \) \
-            -printf '%T@ %p\0'
-    )
 
-    # Standalone save locations
-    local src patterns key
+        log "Local mtime cache is from $cache_date — rebuilding..."
+    fi
 
-    while IFS='|' read -r src patterns; do
-        [ -d "$src" ] || continue
+    log "Building local mtime cache..."
 
-        system="${src##*/}"
-        key="$system|$patterns"
+    tmp_cache="${CACHE_FILE}.tmp"
+    : > "$tmp_cache"
 
-        while IFS= read -r -d '' record; do
-            mtime="${record%% *}"
-            mtime="${mtime%.*}"
+    printf 'DATE|%s\n' "$today" >> "$tmp_cache"
 
-            current="${LOCAL_STANDALONE_MTIME[$key]-0}"
-            (( current < mtime )) && LOCAL_STANDALONE_MTIME["$key"]="$mtime"
+    # Cache system locations.
+    for system in "${!SYSTEM_CACHE[@]}"; do
+        printf 'SYSTEM|%s|%s\n' "$system" "${SYSTEM_CACHE[$system]}" >> "$tmp_cache"
+    done
+
+    # Content-folder saves.
+    if [[ "$USECONTENTFOLDER" == "true" ]]; then
+        while IFS= read -r file; do
+            [[ -f "$file" ]] || continue
+
+            system=$(basename "$(dirname "$file")")
+            mtime=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+
+            [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+
+            if [[ "$file" == *.mcr ]]; then
+                LOCAL_MCR_MTIME["$system"]="${LOCAL_MCR_MTIME[$system]:-0}"
+                (( mtime > LOCAL_MCR_MTIME["$system"] )) &&
+                    LOCAL_MCR_MTIME["$system"]="$mtime"
+            else
+                LOCAL_SAVE_MTIME["$system"]="${LOCAL_SAVE_MTIME[$system]:-0}"
+                (( mtime > LOCAL_SAVE_MTIME["$system"] )) &&
+                    LOCAL_SAVE_MTIME["$system"]="$mtime"
+            fi
         done < <(
-            find "$src" \
-                -maxdepth 1 \
-                \( -name '*.sra' -o -name '*.eep' -o -name '*.fla' \
-                   -o -name '*.dsv' \
-                   -o -name '*.ppst' \
-                   -o -name '*.mcr' \) \
-                -printf '%T@ %p\0'
+            find /roms /roms2 \
+                -type f \
+                \( -name '*.srm' -o -name '*.sav' -o -name '*.state*' -o -name '*.mcr' \) \
+                2>/dev/null
         )
-    done < <(
-        printf '%s\n' \
-            '/roms/n64|*.sra *.eep *.fla' \
-            '/roms/nds/backup|*.dsv' \
-            '/roms/psp/ppsspp/PSP/PPSSPP_STATE|*.ppst'
-    )
+    fi
+
+    # RetroArch save directories.
+    for save_dir in "$RA64_SAVES" "$RA32_SAVES"; do
+        [[ -d "$save_dir" ]] || continue
+
+        while IFS= read -r file; do
+            [[ -f "$file" ]] || continue
+
+            system=$(basename "$(dirname "$file")")
+            mtime=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+
+            [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+
+            if [[ "$file" == *.mcr ]]; then
+                LOCAL_MCR_MTIME["$system"]="${LOCAL_MCR_MTIME[$system]:-0}"
+                (( mtime > LOCAL_MCR_MTIME["$system"] )) &&
+                    LOCAL_MCR_MTIME["$system"]="$mtime"
+            else
+                LOCAL_SAVE_MTIME["$system"]="${LOCAL_SAVE_MTIME[$system]:-0}"
+                (( mtime > LOCAL_SAVE_MTIME["$system"] )) &&
+                    LOCAL_SAVE_MTIME["$system"]="$mtime"
+            fi
+        done < <(
+            find "$save_dir" -type f 2>/dev/null
+        )
+    done
+
+    # Standalone saves.
+    # Every entry is cached, including directories/files with mtime 0.
+
+    for entry in "${STANDALONE_PATHS[@]}"; do
+        path="${entry%%|*}"
+        patterns="${entry#*|}"
+        key="$path|$patterns"
+        latest=0
+
+        if [[ -d "$path" ]]; then
+            if [[ -n "$patterns" ]]; then
+                find_args=()
+                for pat in $patterns; do
+                    find_args+=( -name "$pat" -o )
+                done
+                unset 'find_args[${#find_args[@]}-1]'
+
+                while IFS= read -r file; do
+                    [[ -f "$file" ]] || continue
+                    m=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+                    [[ "$m" =~ ^[0-9]+$ ]] || m=0
+                    (( m > latest )) && latest=$m
+                done < <(find "$path" -type f \( "${find_args[@]}" \) 2>/dev/null)
+            else
+                while IFS= read -r file; do
+                    [[ -f "$file" ]] || continue
+                    m=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+                    [[ "$m" =~ ^[0-9]+$ ]] || m=0
+                    (( m > latest )) && latest=$m
+                done < <(find "$path" -type f 2>/dev/null)
+            fi
+        fi
+
+        LOCAL_STANDALONE_MTIME["$key"]="$latest"
+
+        printf 'SA|%s|%s|%s\n' "$path" "$patterns" "$latest" >> "$tmp_cache"
+    done
+
+    # Mednafen .mcr standalone locations.
+    for system in "${!SYSTEM_CACHE[@]}"; do
+        if [[ " $MEDNAFEN_SYSTEMS " == *" $system "* ]]; then
+            location="${SYSTEM_CACHE[$system]}"
+            path="$location/$system"
+            patterns="*.mcr"
+            key="$path|$patterns"
+            latest=0
+
+            if [[ -d "$path" ]]; then
+                while IFS= read -r file; do
+                    [[ -f "$file" ]] || continue
+                    m=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+                    [[ "$m" =~ ^[0-9]+$ ]] || m=0
+                    (( m > latest )) && latest=$m
+                done < <(find "$path" -type f -name '*.mcr' 2>/dev/null)
+            fi
+
+            LOCAL_STANDALONE_MTIME["$key"]="$latest"
+
+            printf 'SA|%s|%s|%s\n' "$path" "$patterns" "$latest" >> "$tmp_cache"
+        fi
+    done
+
+    # Normal cached mtimes.
+    for system in "${!LOCAL_SAVE_MTIME[@]}"; do
+        printf 'SAVE|%s||%s\n' "$system" "${LOCAL_SAVE_MTIME[$system]}" >> "$tmp_cache"
+    done
+
+    for system in "${!LOCAL_MCR_MTIME[@]}"; do
+        printf 'MCR|%s||%s\n' "$system" "${LOCAL_MCR_MTIME[$system]}" >> "$tmp_cache"
+    done
+
+    mv -f "$tmp_cache" "$CACHE_FILE"
 }
 
 latest_mtime() {
@@ -258,6 +453,45 @@ latest_mtime() {
     echo "$latest"
 }
 
+refresh_game_end_local_cache()
+{
+    local system="$1"
+    local src_dir="$2"
+    local latest
+
+    # Live scan of only the save directory for the game that just ended.
+    latest=$(latest_mtime "$src_dir" "*.srm *.sav *.state*")
+
+    LOCAL_SAVE_MTIME["$system"]="$latest"
+
+    # Persist the updated local mtime cache without rescanning anything else.
+    {
+        printf 'DATE|%s\n' "$(date '+%Y-%m-%d')"
+
+        for s in "${!SYSTEM_CACHE[@]}"; do
+            printf 'SYSTEM|%s|%s\n' "$s" "${SYSTEM_CACHE[$s]}"
+        done
+
+        for s in "${!LOCAL_SAVE_MTIME[@]}"; do
+            printf 'SAVE|%s||%s\n' "$s" "${LOCAL_SAVE_MTIME[$s]}"
+        done
+
+        for s in "${!LOCAL_MCR_MTIME[@]}"; do
+            printf 'MCR|%s||%s\n' "$s" "${LOCAL_MCR_MTIME[$s]}"
+        done
+
+        for key in "${!LOCAL_STANDALONE_MTIME[@]}"; do
+            IFS='|' read -r path patterns <<< "$key"
+            printf 'SA|%s|%s|%s\n' \
+                "$path" \
+                "$patterns" \
+                "${LOCAL_STANDALONE_MTIME[$key]}"
+        done
+    } > "${CACHE_FILE}.tmp"
+
+    mv -f "${CACHE_FILE}.tmp" "$CACHE_FILE"
+}
+
 remote_mtime() {
     local dir="$1" patterns="$2"
     local system="${dir#"$MOUNT_POINT"/}"
@@ -275,21 +509,26 @@ remote_mtime() {
 
 local_mtime() {
     local dir="$1" patterns="$2"
-    local system="${dir#/roms2/}"
-    system="${system%%/*}"
+    local system
 
+    if [[ "$dir" == /roms2/* ]]; then
+        system="${dir#/roms2/}"
+    elif [[ "$dir" == /roms/* ]]; then
+        system="${dir#/roms/}"
+    elif [[ "$dir" == "$RA64_SAVES"/* ]]; then
+        system="${dir#"$RA64_SAVES"/}"
+    elif [[ "$dir" == "$RA32_SAVES"/* ]]; then
+        system="${dir#"$RA32_SAVES"/}"
+    else
+        system=""
+    fi
+
+    system="${system%%/*}"
+	
     if [ "$patterns" = "*.mcr" ]; then
-        if [[ -v "LOCAL_MCR_MTIME[$system]" ]]; then
-            printf '%s\n' "${LOCAL_MCR_MTIME[$system]}"
-        else
-            printf '%s\n' 0
-        fi
+        printf '%s\n' "${LOCAL_MCR_MTIME[$system]-0}"
     elif [ "$patterns" = "*.srm *.sav *.state*" ]; then
-        if [[ -v "LOCAL_SAVE_MTIME[$system]" ]]; then
-            printf '%s\n' "${LOCAL_SAVE_MTIME[$system]}"
-        else
-            printf '%s\n' 0
-        fi
+        printf '%s\n' "${LOCAL_SAVE_MTIME[$system]-0}"
     else
         latest_mtime "$dir" "$patterns"
     fi
@@ -324,11 +563,21 @@ sync_dir() {
             return
         }
 
-        log "Copying (console->PC): $src -> $dst"
+        log "Copying (console->PC): $src"
 
         rsync -au --no-owner --no-group \
             "${rsync_opts[@]}" \
             "$src/" "$dst/" >> "$LOG_FILE" 2>&1
+
+        if [[ "$dst" == "$MOUNT_POINT/"* ]]; then
+            local rc_system="${dst#"$MOUNT_POINT"/}"
+            rc_system="${rc_system%%/*}"
+            if [ "$patterns" = "*.mcr" ]; then
+                REMOTE_MCR_MTIME["$rc_system"]="$src_m"
+            elif [ "$patterns" = "*.srm *.sav *.state*" ]; then
+                REMOTE_SAVE_MTIME["$rc_system"]="$src_m"
+            fi
+        fi
 
     elif [ "$src_m" -eq 0 ]; then
         mkdir -p "$src" || {
@@ -336,18 +585,28 @@ sync_dir() {
             return
         }
 
-        log "Copying (PC->console): $dst -> $src"
+        log "Copying (PC->console): $src"
 
         rsync -au --no-owner --no-group \
             "${rsync_opts[@]}" \
             "$dst/" "$src/" >> "$LOG_FILE" 2>&1
 
     elif [ "$src_m" -ne "$dst_m" ]; then
-        log "Syncing (2 way): $src -> $dst, $dst -> $src"
+        log "Syncing (2 way): $src"
 
         rsync -au --no-owner --no-group \
             "${rsync_opts[@]}" \
             "$src/" "$dst/" >> "$LOG_FILE" 2>&1
+
+        if [[ "$dst" == "$MOUNT_POINT/"* ]]; then
+            local rc_system="${dst#"$MOUNT_POINT"/}"
+            rc_system="${rc_system%%/*}"
+            if [ "$patterns" = "*.mcr" ]; then
+                REMOTE_MCR_MTIME["$rc_system"]="$src_m"
+            elif [ "$patterns" = "*.srm *.sav *.state*" ]; then
+                REMOTE_SAVE_MTIME["$rc_system"]="$src_m"
+            fi
+        fi
 
         rsync -au --no-owner --no-group \
             "${rsync_opts[@]}" \
@@ -355,124 +614,39 @@ sync_dir() {
     fi
 }
 
-sync_standalone() {
+sync_standalone()
+{
     local src="$1"
     local filter="$2"
+
+    local key="$src|$filter"
+    local src_m="${LOCAL_STANDALONE_MTIME[$key]:-0}"
+    local dst_m="${REMOTE_STANDALONE_MTIME[$key]:-0}"
+
     local rel="${src#/roms2/}"
     rel="${rel#/roms/}"
+
     local dst="$MOUNT_POINT/$rel"
-    local src_m=0 dst_m=0
-    local pat first=1
-    local find_args
 
-    [ -d "$src" ] || mkdir -p "$src"
-    [ -d "$dst" ] || mkdir -p "$dst"
+    mkdir -p "$dst"
 
-    # Build a shallow find for the requested standalone files.
-    # Empty filter means the entire directory.
-    find_args=("$src" -mindepth 1 -maxdepth 1)
+    if (( src_m > dst_m )); then
+        rsync -a --update \
+            --include='*/' \
+            $(for p in $filter; do printf -- "--include=%s " "$p"; done) \
+            --exclude='*' \
+            "$src/" "$dst/"
 
-    if [ -n "$filter" ]; then
-        find_args+=(\( )
-        for pat in $filter; do
-            (( first )) || find_args+=(-o)
-            find_args+=(-name "$pat")
-            first=0
-        done
-        find_args+=(\))
-    fi
+        REMOTE_STANDALONE_MTIME["$key"]="$src_m"
 
-    while IFS= read -r mtime; do
-        mtime="${mtime%.*}"
-        (( mtime > src_m )) && src_m="$mtime"
-    done < <(find "${find_args[@]}" -printf '%T@\n' 2>/dev/null)
+    elif (( dst_m > src_m )); then
+        rsync -a --update \
+            --include='*/' \
+            $(for p in $filter; do printf -- "--include=%s " "$p"; done) \
+            --exclude='*' \
+            "$dst/" "$src/"
 
-    # Same check on the remote directory.
-    find_args=("$dst" -mindepth 1 -maxdepth 1)
-    first=1
-
-    if [ -n "$filter" ]; then
-        find_args+=(\( )
-        for pat in $filter; do
-            (( first )) || find_args+=(-o)
-            find_args+=(-name "$pat")
-            first=0
-        done
-        find_args+=(\))
-    fi
-
-    while IFS= read -r mtime; do
-        mtime="${mtime%.*}"
-        (( mtime > dst_m )) && dst_m="$mtime"
-    done < <(find "${find_args[@]}" -printf '%T@\n' 2>/dev/null)
-
-    # Nothing exists on either side.
-    if [ "$src_m" -eq 0 ] && [ "$dst_m" -eq 0 ]; then
-        return 0
-    fi
-
-    # Only local exists.
-    if [ "$dst_m" -eq 0 ]; then
-        log "Syncing standalone: $src -> $dst (filter: ${filter:-all})"
-
-        if [ -n "$filter" ]; then
-            local include_args=()
-            for pat in $filter; do
-                include_args+=(--include="$pat")
-            done
-            rsync -au --no-owner --no-group \
-                "${include_args[@]}" --exclude='*' \
-                "$src/" "$dst/" >> "$LOG_FILE" 2>&1
-        else
-            rsync -au --no-owner --no-group \
-                "$src/" "$dst/" >> "$LOG_FILE" 2>&1
-        fi
-        return
-    fi
-
-    # Only remote exists.
-    if [ "$src_m" -eq 0 ]; then
-        log "Syncing standalone: $dst -> $src (filter: ${filter:-all})"
-
-        if [ -n "$filter" ]; then
-            local include_args=()
-            for pat in $filter; do
-                include_args+=(--include="$pat")
-            done
-            rsync -au --no-owner --no-group \
-                "${include_args[@]}" --exclude='*' \
-                "$dst/" "$src/" >> "$LOG_FILE" 2>&1
-        else
-            rsync -au --no-owner --no-group \
-                "$dst/" "$src/" >> "$LOG_FILE" 2>&1
-        fi
-        return
-    fi
-
-    # Newest timestamp differs: preserve the original two-way sync behavior.
-    if [ "$src_m" -ne "$dst_m" ]; then
-        log "Syncing standalone: $src <-> $dst (filter: ${filter:-all})"
-
-        if [ -n "$filter" ]; then
-            local include_args=()
-            for pat in $filter; do
-                include_args+=(--include="$pat")
-            done
-
-            rsync -au --no-owner --no-group \
-                "${include_args[@]}" --exclude='*' \
-                "$src/" "$dst/" >> "$LOG_FILE" 2>&1
-
-            rsync -au --no-owner --no-group \
-                "${include_args[@]}" --exclude='*' \
-                "$dst/" "$src/" >> "$LOG_FILE" 2>&1
-        else
-            rsync -au --no-owner --no-group \
-                "$src/" "$dst/" >> "$LOG_FILE" 2>&1
-
-            rsync -au --no-owner --no-group \
-                "$dst/" "$src/" >> "$LOG_FILE" 2>&1
-        fi
+        LOCAL_STANDALONE_MTIME["$key"]="$dst_m"
     fi
 }
 
@@ -482,9 +656,23 @@ mount_smb() {
     if [[ "$HOST" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
         network_ip="$HOST"
     else
-        network_ip=$(nmblookup "$HOST" 2>/dev/null |
-            grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' |
-            head -n 1)
+        network_ip=""
+
+        for attempt in 1 2 3; do
+            network_ip=$(nmblookup "$HOST" 2>/dev/null |
+                grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' |
+                head -n 1) || true
+
+            if [[ -n "$network_ip" ]]; then
+                break
+            fi
+
+            log "NetBIOS lookup failed for $HOST (attempt $attempt/3)"
+
+            if [[ "$attempt" -lt 3 ]]; then
+                sleep 1
+            fi
+        done
     fi
 
     if [[ -z "$network_ip" ]]; then
@@ -659,9 +847,12 @@ fi
 PC_CFG="$MOUNT_POINT/$PC_CFG_NAME"
 
 if [ ! -f "$PC_CFG" ]; then
-    log "ERROR: PC config not found at $PC_CFG"
-    umount "$MOUNT_POINT"
-    exit 1
+    log "PC config not found at $PC_CFG — creating default (USECONTENTFOLDER=false)"
+    printf 'USECONTENTFOLDER=false\n' > "$PC_CFG" || {
+        log "ERROR: failed to create default PC config at $PC_CFG"
+        umount "$MOUNT_POINT"
+        exit 1
+    }
 fi
 
 USECONTENTFOLDER=$( { grep -E '^USECONTENTFOLDER=' "$PC_CFG" || true; } | cut -d'=' -f2 | tr -d '[:space:]')
@@ -672,12 +863,29 @@ if [[ "$USECONTENTFOLDER" != "true" && "$USECONTENTFOLDER" != "false" ]]; then
     exit 1
 fi
 
-while IFS='|' read -r system location; do
-    [ -n "$system" ] || continue
-    SYSTEM_CACHE["$system"]="$location"
-done < "$CACHE_FILE"
+# --- Load persistent local/system cache ---
+SYSTEM_CACHE=()
 
-# --- Build the PC-side mtime cache once ---
+if [ -f "$CACHE_FILE" ]; then
+    while IFS='|' read -r type key value extra; do
+        case "$type" in
+            SYSTEM)
+                SYSTEM_CACHE["$key"]="$value"
+                ;;
+            SAVE)
+                LOCAL_SAVE_MTIME["$key"]="$value"
+                ;;
+            MCR)
+                LOCAL_MCR_MTIME["$key"]="$value"
+                ;;
+            SA)
+                LOCAL_STANDALONE_MTIME["$key|$value"]="$extra"
+                ;;
+        esac
+    done < "$CACHE_FILE"
+fi
+
+# --- Build/load local cache ---
 build_local_mtime_cache
 build_remote_mtime_cache
 
@@ -686,6 +894,12 @@ CONTENT_MODE=$( { grep '^savefiles_in_content_dir' "$RA_CFG" || true; } | grep -
 
 # --- Sync every system listed in es_systems.cfg ---
 while IFS='|' read -r SYSTEM LOCATION RA64_ENABLED RA32_ENABLED; do
+
+    # Game-end mode syncs only the system that just closed.
+    if [ -n "$GAME_END_SYSTEM" ] && [ "$SYSTEM" != "$GAME_END_SYSTEM" ]; then
+        continue
+    fi
+
     [[ -v "SYSTEM_CACHE[$SYSTEM]" ]] || continue
 		
     # Resolve console source dir
@@ -700,6 +914,11 @@ while IFS='|' read -r SYSTEM LOCATION RA64_ENABLED RA32_ENABLED; do
         else
             continue
         fi
+    fi
+
+    # Game-end must live-scan the save directory before using the mtime cache.
+    if [ -n "$GAME_END_SYSTEM" ]; then
+        refresh_game_end_local_cache "$SYSTEM" "$SRC_DIR"
     fi
 
     # Resolve PC target dir
@@ -742,8 +961,39 @@ done < <(awk '
 for entry in "${STANDALONE_PATHS[@]}"; do
     SA_SRC="${entry%%|*}"
     SA_FILTER="${entry#*|}"
+
+    # Game-end mode only syncs standalone saves belonging to that system.
+    if [ -n "$GAME_END_SYSTEM" ]; then
+        SA_SYSTEM="${SA_SRC#/roms/}"
+        SA_SYSTEM="${SA_SYSTEM#/roms2/}"
+        SA_SYSTEM="${SA_SYSTEM%%/*}"
+
+        [ "$SA_SYSTEM" = "$GAME_END_SYSTEM" ] || continue
+    fi
+
     sync_standalone "$SA_SRC" "$SA_FILTER"
 done
+
+# --- Persist incremental remote cache updates (fast-sync mode only) ---
+if [ -f "$FASTSYNC_FILE" ]; then
+    {
+        printf 'DATE|%s\n' "$(date '+%Y-%m-%d')"
+        for s in "${!REMOTE_SAVE_MTIME[@]}"; do
+            printf 'SAVE|%s||%s\n' "$s" "${REMOTE_SAVE_MTIME[$s]}"
+        done
+        for s in "${!REMOTE_MCR_MTIME[@]}"; do
+            printf 'MCR|%s||%s\n' "$s" "${REMOTE_MCR_MTIME[$s]}"
+        done
+		for key in "${!REMOTE_STANDALONE_MTIME[@]}"; do
+			IFS='|' read -r path patterns <<< "$key"
+
+			printf 'SA|%s|%s|%s\n' \
+				"$path" \
+				"$patterns" \
+				"${REMOTE_STANDALONE_MTIME[$key]}"
+		done
+    } > "$MTIME_CACHE_FILE"
+fi
 
 # --- Unmount ---
 umount "$MOUNT_POINT"
