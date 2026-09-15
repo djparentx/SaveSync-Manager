@@ -940,40 +940,29 @@ latest_mtime() {
 refresh_game_end_local_cache()
 {
     local system="$1"
-    local src_dir="$2"
-    local latest
+    local latest="$2"
+    local tmp="${CACHE_FILE}.tmp"
 
-    # Live scan of only the save directory for the game that just ended.
-    latest=$(latest_mtime "$src_dir" "*.srm *.sav *.state* *.auto")
+    {
+        while IFS= read -r line; do
+            case "$line" in
+                "SAVE|$system||"*)
+                    printf 'SAVE|%s||%s\n' "$system" "$latest"
+                    ;;
+                *)
+                    printf '%s\n' "$line"
+                    ;;
+            esac
+        done < "$CACHE_FILE"
+
+        if ! grep -q "^SAVE|${system}||" "$CACHE_FILE"; then
+            printf 'SAVE|%s||%s\n' "$system" "$latest"
+        fi
+    } > "$tmp"
+
+    mv -f "$tmp" "$CACHE_FILE"
 
     LOCAL_SAVE_MTIME["$system"]="$latest"
-
-    # Persist the updated local mtime cache without rescanning anything else.
-    {
-        printf 'DATE|%s\n' "$(date '+%Y-%m-%d')"
-
-        for s in "${!SYSTEM_CACHE[@]}"; do
-            printf 'SYSTEM|%s|%s\n' "$s" "${SYSTEM_CACHE[$s]}"
-        done
-
-        for s in "${!LOCAL_SAVE_MTIME[@]}"; do
-            printf 'SAVE|%s||%s\n' "$s" "${LOCAL_SAVE_MTIME[$s]}"
-        done
-
-        for s in "${!LOCAL_MCR_MTIME[@]}"; do
-            printf 'MCR|%s||%s\n' "$s" "${LOCAL_MCR_MTIME[$s]}"
-        done
-
-        for key in "${!LOCAL_STANDALONE_MTIME[@]}"; do
-            IFS='|' read -r path patterns <<< "$key"
-            printf 'SA|%s|%s|%s\n' \
-                "$path" \
-                "$patterns" \
-                "${LOCAL_STANDALONE_MTIME[$key]}"
-        done
-    } > "${CACHE_FILE}.tmp"
-
-    mv -f "${CACHE_FILE}.tmp" "$CACHE_FILE"
 }
 
 remote_mtime() {
@@ -1109,47 +1098,32 @@ game_end_sync()
     local src="$2"
     local dst="$3"
     local src_m
+    local rsync_opts=()
 
-    mkdir -p "$dst"
+    for pat in "*.srm" "*.sav" "*.state*" "*.auto"; do
+        rsync_opts+=(--include="$pat")
+    done
+    rsync_opts+=(--exclude='*')
 
-    # Live check of the game's save directory.
-    src_m=$(latest_mtime "$src" "*.srm *.sav *.state*")
+    # The one live scan for game-end.
+    src_m=$(latest_mtime "$src" "*.srm *.sav *.state* *.auto")
 
-    # Game-end is always console -> PC.
+    mkdir -p "$dst" || {
+        log "ERROR: mkdir failed for $dst"
+        return 1
+    }
+
     log "Game-end sync (console->PC): $src"
 
     rsync -au --no-owner --no-group \
-        "$src/" "$dst/" >> "$LOG_FILE" 2>&1
+        "${rsync_opts[@]}" \
+        "$src/" "$dst/" >> "$LOG_FILE" 2>&1 || {
+        log "ERROR: game-end rsync failed for $system"
+        return 1
+    }
 
-    # FastSync: update only this system in both caches.
-    if [ -f "$FASTSYNC_FILE" ]; then
-        LOCAL_SAVE_MTIME["$system"]="$src_m"
-        REMOTE_SAVE_MTIME["$system"]="$src_m"
-
-        {
-            printf 'DATE|%s\n' "$(date '+%Y-%m-%d')"
-
-            for s in "${!SYSTEM_CACHE[@]}"; do
-                printf 'SYSTEM|%s|%s\n' "$s" "${SYSTEM_CACHE[$s]}"
-            done
-
-            for s in "${!LOCAL_SAVE_MTIME[@]}"; do
-                printf 'SAVE|%s||%s\n' "$s" "${LOCAL_SAVE_MTIME[$s]}"
-            done
-
-            for s in "${!LOCAL_MCR_MTIME[@]}"; do
-                printf 'MCR|%s||%s\n' "$s" "${LOCAL_MCR_MTIME[$s]}"
-            done
-
-            for key in "${!LOCAL_STANDALONE_MTIME[@]}"; do
-                IFS='|' read -r path patterns <<< "$key"
-                printf 'SA|%s|%s|%s\n' \
-                    "$path" "$patterns" "${LOCAL_STANDALONE_MTIME[$key]}"
-            done
-        } > "${CACHE_FILE}.tmp"
-
-        mv -f "${CACHE_FILE}.tmp" "$CACHE_FILE"
-    fi
+    # Persist the exact mtime from the live scan.
+    refresh_game_end_local_cache "$system" "$src_m"
 }
 
 sync_standalone()
@@ -1405,28 +1379,38 @@ fi
 SYSTEM_CACHE=()
 
 if [ -f "$CACHE_FILE" ]; then
-    while IFS='|' read -r type key value extra; do
-        case "$type" in
-            SYSTEM)
-                SYSTEM_CACHE["$key"]="$value"
-                ;;
-            SAVE)
-                LOCAL_SAVE_MTIME["$key"]="$value"
-                ;;
-            MCR)
-                LOCAL_MCR_MTIME["$key"]="$value"
-                ;;
-            SA)
-                LOCAL_STANDALONE_MTIME["$key|$value"]="$extra"
-                ;;
-        esac
-    done < "$CACHE_FILE"
+	while IFS='|' read -r type key value extra; do
+		case "$type" in
+			SYSTEM)
+				SYSTEM_CACHE["$key"]="$value"
+				;;
+			SAVE)
+				LOCAL_SAVE_MTIME["$key"]="$value"
+				;;
+			MCR)
+				LOCAL_MCR_MTIME["$key"]="$value"
+				;;
+			SA)
+				LOCAL_STANDALONE_MTIME["$key|$value"]="$extra"
+				;;
+		esac
+	done < "$CACHE_FILE"
 fi
 
 # --- Build/load caches ---
 if [ -z "$GAME_END_SYSTEM" ]; then
     build_local_mtime_cache
     build_remote_mtime_cache
+fi
+
+if [ -n "$GAME_END_SYSTEM" ] && [ -f "$FASTSYNC_FILE" ] && [ -f "$MTIME_CACHE_FILE" ]; then
+    while IFS='|' read -r type key1 key2 val; do
+        case "$type" in
+            SAVE) REMOTE_SAVE_MTIME["$key1"]="$val" ;;
+            MCR) REMOTE_MCR_MTIME["$key1"]="$val" ;;
+            SA) REMOTE_STANDALONE_MTIME["$key1|$key2"]="$val" ;;
+        esac
+    done < "$MTIME_CACHE_FILE"
 fi
 
 # --- Determine console's current active save mode ---
@@ -1456,11 +1440,6 @@ while IFS='|' read -r SYSTEM LOCATION RA64_ENABLED RA32_ENABLED; do
         fi
     fi
 
-    # Game-end must live-scan the save directory before using the mtime cache.
-    if [ -n "$GAME_END_SYSTEM" ]; then
-        refresh_game_end_local_cache "$SYSTEM" "$SRC_DIR"
-    fi
-
     # Resolve PC target dir
     if [ "$USECONTENTFOLDER" = "true" ]; then
         DST_DIR="$MOUNT_POINT/$SYSTEM/$SYSTEM"
@@ -1471,10 +1450,10 @@ while IFS='|' read -r SYSTEM LOCATION RA64_ENABLED RA32_ENABLED; do
 	if [ -n "$GAME_END_SYSTEM" ]; then
 		game_end_sync "$SYSTEM" "$SRC_DIR" "$DST_DIR"
 		continue
+	else
+		sync_dir "$SRC_DIR" "$DST_DIR" "*.srm *.sav *.state* *.auto"
 	fi
-
-	sync_dir "$SRC_DIR" "$DST_DIR" "*.srm *.sav *.state* *.auto"
-
+	
     # Mednafen save sync (.mcr, same dir as ROMs, flat mirror)
     if [ -n "$LOCATION" ] && [[ " $MEDNAFEN_SYSTEMS " == *" $SYSTEM "* ]]; then
         sync_standalone "$LOCATION/$SYSTEM" "*.mcr"
