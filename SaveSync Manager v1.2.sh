@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =======================================
-# SaveSync Manager v1.1
+# SaveSync Manager v1.2
 # by djparent
 # =======================================
 
@@ -57,7 +57,7 @@ RA32="/home/ark/.config/retroarch32"
 RA64_CFG="$RA64/retroarch.cfg"
 RA32_CFG="$RA32/retroarch.cfg"
 
-T_BACKTITLE="SaveSync Manager v1.1 by djparent"
+T_BACKTITLE="SaveSync Manager v1.2 by djparent"
 T_STARTING="Starting $T_BACKTITLE please wait..."
 T_MAIN_TITLE="Main Menu"
 T_LOG_TITLE="Log Menu"
@@ -487,8 +487,10 @@ set -Eeuo pipefail
 trap 'echo "$(date "+%Y-%m-%d %H:%M:%S") - CRASH: line $LINENO, exit $?, cmd: $BASH_COMMAND" >> /home/ark/.config/savesync.log' ERR
 
 declare -A LOCAL_SAVE_MTIME
+declare -A LOCAL_STATE_MTIME
 declare -A LOCAL_MCR_MTIME
 declare -A REMOTE_SAVE_MTIME
+declare -A REMOTE_STATE_MTIME
 declare -A REMOTE_MCR_MTIME
 declare -A LOCAL_STANDALONE_MTIME
 declare -A REMOTE_STANDALONE_MTIME
@@ -621,14 +623,15 @@ standalone_cache_entries()
 build_remote_mtime_cache()
 {
     REMOTE_SAVE_MTIME=()
+    REMOTE_STATE_MTIME=()
     REMOTE_MCR_MTIME=()
     REMOTE_STANDALONE_MTIME=()
-	local today
-	local cache_date
-	local entry path patterns key latest rel dst
-	local system
-	local pat m
-	local -a find_args
+
+    local today cache_date
+    local entry path patterns key latest rel dst
+    local system
+    local pat m
+    local -a find_args
 
     today=$(date +%F)
 
@@ -639,9 +642,10 @@ build_remote_mtime_cache()
         if [[ "$cache_date" == "$today" ]]; then
             while IFS='|' read -r type key1 key2 val; do
                 case "$type" in
-                    SAVE) REMOTE_SAVE_MTIME["$key1"]="$val" ;;
-                    MCR)  REMOTE_MCR_MTIME["$key1"]="$val" ;;
-                    SA)   REMOTE_STANDALONE_MTIME["$key1|$key2"]="$val" ;;
+                    SAVE)  REMOTE_SAVE_MTIME["$key1"]="$val" ;;
+                    STATE) REMOTE_STATE_MTIME["$key1"]="$val" ;;
+                    MCR)   REMOTE_MCR_MTIME["$key1"]="$val" ;;
+                    SA)    REMOTE_STANDALONE_MTIME["$key1|$key2"]="$val" ;;
                 esac
             done < "$MTIME_CACHE_FILE"
 
@@ -651,7 +655,36 @@ build_remote_mtime_cache()
 
     log "Building remote mtime cache..."
 
-    # Normal saves.
+    # RetroArch saves and states.
+    while IFS= read -r system_dir; do
+        system=$(basename "$(dirname "$system_dir")")
+
+        latest=0
+        while IFS= read -r file; do
+            [[ -f "$file" ]] || continue
+            m=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+            [[ "$m" =~ ^[0-9]+$ ]] || m=0
+            (( m > latest )) && latest=$m
+        done < <(find "$system_dir" -type f 2>/dev/null)
+
+        REMOTE_SAVE_MTIME["$system"]="$latest"
+    done < <(find "$MOUNT_POINT" -mindepth 2 -maxdepth 2 -type d -name saves 2>/dev/null)
+
+    while IFS= read -r system_dir; do
+        system=$(basename "$(dirname "$system_dir")")
+
+        latest=0
+        while IFS= read -r file; do
+            [[ -f "$file" ]] || continue
+            m=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+            [[ "$m" =~ ^[0-9]+$ ]] || m=0
+            (( m > latest )) && latest=$m
+        done < <(find "$system_dir" -type f 2>/dev/null)
+
+        REMOTE_STATE_MTIME["$system"]="$latest"
+    done < <(find "$MOUNT_POINT" -mindepth 2 -maxdepth 2 -type d -name states 2>/dev/null)
+
+    # Mednafen .mcr files.
     while IFS= read -r file; do
         [[ -f "$file" ]] || continue
 
@@ -659,24 +692,17 @@ build_remote_mtime_cache()
         mtime=$(stat -c %Y "$file" 2>/dev/null || echo 0)
         [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
 
-        if [[ "$file" == *.mcr ]]; then
-            REMOTE_MCR_MTIME["$system"]="${REMOTE_MCR_MTIME[$system]:-0}"
-            (( mtime > REMOTE_MCR_MTIME["$system"] )) &&
-                REMOTE_MCR_MTIME["$system"]="$mtime"
-        else
-            REMOTE_SAVE_MTIME["$system"]="${REMOTE_SAVE_MTIME[$system]:-0}"
-            (( mtime > REMOTE_SAVE_MTIME["$system"] )) &&
-                REMOTE_SAVE_MTIME["$system"]="$mtime"
-        fi
+        REMOTE_MCR_MTIME["$system"]="${REMOTE_MCR_MTIME[$system]:-0}"
+        (( mtime > REMOTE_MCR_MTIME["$system"] )) &&
+            REMOTE_MCR_MTIME["$system"]="$mtime"
     done < <(
         find "$MOUNT_POINT" \
             -type f \
-            \( -name '*.srm' -o -name '*.sav' -o -name '*.state*' -o -name '*.mcr' \) \
+            -name '*.mcr' \
             2>/dev/null
     )
 
     # All standalone locations.
-
     while IFS= read -r entry; do
         path="${entry%%|*}"
         patterns="${entry#*|}"
@@ -718,15 +744,15 @@ build_remote_mtime_cache()
     if [[ -f "$FASTSYNC_FILE" ]]; then
         {
             printf 'DATE|%s\n' "$today"
-
             for system in "${!REMOTE_SAVE_MTIME[@]}"; do
                 printf 'SAVE|%s||%s\n' "$system" "${REMOTE_SAVE_MTIME[$system]}"
             done
-
+            for system in "${!REMOTE_STATE_MTIME[@]}"; do
+                printf 'STATE|%s||%s\n' "$system" "${REMOTE_STATE_MTIME[$system]}"
+            done
             for system in "${!REMOTE_MCR_MTIME[@]}"; do
                 printf 'MCR|%s||%s\n' "$system" "${REMOTE_MCR_MTIME[$system]}"
             done
-
             for key in "${!REMOTE_STANDALONE_MTIME[@]}"; do
                 IFS='|' read -r path patterns <<< "$key"
                 printf 'SA|%s|%s|%s\n' "$path" "$patterns" "${REMOTE_STANDALONE_MTIME[$key]}"
@@ -758,18 +784,11 @@ build_local_mtime_cache()
         if [[ "$cache_date" == "$today" ]]; then
             while IFS='|' read -r type key1 key2 val; do
                 case "$type" in
-                    SYSTEM)
-                        SYSTEM_CACHE["$key1"]="$key2"
-                        ;;
-                    SAVE)
-                        LOCAL_SAVE_MTIME["$key1"]="$val"
-                        ;;
-                    MCR)
-                        LOCAL_MCR_MTIME["$key1"]="$val"
-                        ;;
-                    SA)
-                        LOCAL_STANDALONE_MTIME["$key1|$key2"]="$val"
-                        ;;
+                    SYSTEM) SYSTEM_CACHE["$key1"]="$key2" ;;
+                    SAVE) LOCAL_SAVE_MTIME["$key1"]="$val" ;;
+					STATE) LOCAL_STATE_MTIME["$key1"]="$val" ;;
+                    MCR) LOCAL_MCR_MTIME["$key1"]="$val" ;;
+                    SA) LOCAL_STANDALONE_MTIME["$key1|$key2"]="$val" ;;
                 esac
             done < "$CACHE_FILE"
 
@@ -830,17 +849,38 @@ build_local_mtime_cache()
 
             [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
 
-            if [[ "$file" == *.mcr ]]; then
-                LOCAL_MCR_MTIME["$system"]="${LOCAL_MCR_MTIME[$system]:-0}"
-                (( mtime > LOCAL_MCR_MTIME["$system"] )) &&
-                    LOCAL_MCR_MTIME["$system"]="$mtime"
-            else
+            if [[ "$file" != *.state* && "$file" != *.auto ]]; then
                 LOCAL_SAVE_MTIME["$system"]="${LOCAL_SAVE_MTIME[$system]:-0}"
                 (( mtime > LOCAL_SAVE_MTIME["$system"] )) &&
                     LOCAL_SAVE_MTIME["$system"]="$mtime"
             fi
         done < <(
             find "$save_dir" -type f 2>/dev/null
+        )
+    done
+
+    # RetroArch state directories.
+    for state_dir in \
+        "/home/ark/.config/retroarch/states" \
+        "/home/ark/.config/retroarch32/states"; do
+
+        [[ -d "$state_dir" ]] || continue
+
+        while IFS= read -r file; do
+            [[ -f "$file" ]] || continue
+
+            system=$(basename "$(dirname "$file")")
+            mtime=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+
+            [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+
+            LOCAL_STATE_MTIME["$system"]="${LOCAL_STATE_MTIME[$system]:-0}"
+            (( mtime > LOCAL_STATE_MTIME["$system"] )) &&
+                LOCAL_STATE_MTIME["$system"]="$mtime"
+        done < <(
+            find "$state_dir" -type f \
+                \( -name '*.state*' -o -name '*.auto' \) \
+                2>/dev/null
         )
     done
 
@@ -911,6 +951,10 @@ build_local_mtime_cache()
         printf 'SAVE|%s||%s\n' "$system" "${LOCAL_SAVE_MTIME[$system]}" >> "$tmp_cache"
     done
 
+    for system in "${!LOCAL_STATE_MTIME[@]}"; do
+        printf 'STATE|%s||%s\n' "$system" "${LOCAL_STATE_MTIME[$system]}" >> "$tmp_cache"
+    done
+
     for system in "${!LOCAL_MCR_MTIME[@]}"; do
         printf 'MCR|%s||%s\n' "$system" "${LOCAL_MCR_MTIME[$system]}" >> "$tmp_cache"
     done
@@ -963,11 +1007,13 @@ refresh_game_end_local_cache()
 
     mv -f "$tmp" "$CACHE_FILE"
 
-    if [ "$type" = "MCR" ]; then
-        LOCAL_MCR_MTIME["$system"]="$latest"
-    else
-        LOCAL_SAVE_MTIME["$system"]="$latest"
-    fi
+	if [ "$type" = "MCR" ]; then
+		LOCAL_MCR_MTIME["$system"]="$latest"
+	elif [ "$type" = "STATE" ]; then
+		LOCAL_STATE_MTIME["$system"]="$latest"
+	else
+		LOCAL_SAVE_MTIME["$system"]="$latest"
+	fi
 }
 
 remote_mtime() {
@@ -978,8 +1024,10 @@ remote_mtime() {
 
     if [ "$patterns" = "*.mcr" ]; then
         printf '%s\n' "${REMOTE_MCR_MTIME[$system]-0}"
-    elif [ "$patterns" = "*.srm *.sav *.state* *.auto" ]; then
+    elif [ "$patterns" = "*.srm *.sav" ]; then
         printf '%s\n' "${REMOTE_SAVE_MTIME[$system]-0}"
+    elif [ "$patterns" = "*.state* *.auto" ]; then
+        printf '%s\n' "${REMOTE_STATE_MTIME[$system]-0}"
     else
         latest_mtime "$dir" "$patterns"
     fi
@@ -997,16 +1045,22 @@ local_mtime() {
         system="${dir#"$RA64_SAVES"/}"
     elif [[ "$dir" == "$RA32_SAVES"/* ]]; then
         system="${dir#"$RA32_SAVES"/}"
+    elif [[ "$dir" == "/home/ark/.config/retroarch/states/"* ]]; then
+        system="${dir#"/home/ark/.config/retroarch/states/"}"
+    elif [[ "$dir" == "/home/ark/.config/retroarch32/states/"* ]]; then
+        system="${dir#"/home/ark/.config/retroarch32/states/"}"
     else
         system=""
     fi
 
     system="${system%%/*}"
-	
+
     if [ "$patterns" = "*.mcr" ]; then
         printf '%s\n' "${LOCAL_MCR_MTIME[$system]-0}"
-    elif [ "$patterns" = "*.srm *.sav *.state* *.auto" ]; then
+    elif [ "$patterns" = "*.srm *.sav" ]; then
         printf '%s\n' "${LOCAL_SAVE_MTIME[$system]-0}"
+    elif [ "$patterns" = "*.state* *.auto" ]; then
+        printf '%s\n' "${LOCAL_STATE_MTIME[$system]-0}"
     else
         latest_mtime "$dir" "$patterns"
     fi
@@ -1016,21 +1070,28 @@ sync_dir() {
     local src="$1" dst="$2" patterns="$3" filter="${4:-}"
     local src_m dst_m pat rsync_opts=()
     local system tmp_cache
-
-    if [ -n "$filter" ]; then
-        for pat in $filter; do
+    local src_save_m src_state_m dst_save_m dst_state_m
+	
+    if [ -n "$patterns" ]; then
+        for pat in $patterns; do
             rsync_opts+=(--include="$pat")
         done
         rsync_opts+=(--exclude='*')
     fi
 
-    src_m=$(local_mtime "$src" "$patterns")
+	src_save_m=$(local_mtime "$src" "*.srm *.sav")
+	src_state_m=$(local_mtime "$src" "*.state* *.auto")
 
-    if [[ "$dst" == "$MOUNT_POINT/"* ]]; then
-        dst_m=$(remote_mtime "$dst" "$patterns")
-    else
-        dst_m=$(latest_mtime "$dst" "$patterns")
-    fi
+	if [[ "$dst" == "$MOUNT_POINT/"* ]]; then
+		dst_save_m=$(remote_mtime "$dst" "*.srm *.sav")
+		dst_state_m=$(remote_mtime "$dst" "*.state* *.auto")
+	else
+		dst_save_m=$(latest_mtime "$dst" "*.srm *.sav")
+		dst_state_m=$(latest_mtime "$dst" "*.state* *.auto")
+	fi
+
+	src_m=$(( src_save_m > src_state_m ? src_save_m : src_state_m ))
+	dst_m=$(( dst_save_m > dst_state_m ? dst_save_m : dst_state_m ))
 
     if [ "$src_m" -eq 0 ] && [ "$dst_m" -eq 0 ]; then
         return 0
@@ -1055,6 +1116,7 @@ sync_dir() {
                 REMOTE_MCR_MTIME["$rc_system"]="$src_m"
             elif [ "$patterns" = "*.srm *.sav *.state* *.auto" ]; then
                 REMOTE_SAVE_MTIME["$rc_system"]="$src_m"
+                REMOTE_STATE_MTIME["$rc_system"]="$src_m"
             fi
         fi
 
@@ -1072,7 +1134,8 @@ sync_dir() {
 
         system="${src##*/}"
         LOCAL_SAVE_MTIME["$system"]="$dst_m"
-
+		LOCAL_STATE_MTIME["$system"]="$dst_m"
+		
     elif [ "$src_m" -ne "$dst_m" ]; then
 
         if [ "$src_m" -gt "$dst_m" ]; then
@@ -1086,11 +1149,12 @@ sync_dir() {
                 local rc_system="${dst#"$MOUNT_POINT"/}"
                 rc_system="${rc_system%%/*}"
 
-                if [ "$patterns" = "*.mcr" ]; then
-                    REMOTE_MCR_MTIME["$rc_system"]="$src_m"
-                elif [ "$patterns" = "*.srm *.sav *.state* *.auto" ]; then
-                    REMOTE_SAVE_MTIME["$rc_system"]="$src_m"
-                fi
+				if [ "$patterns" = "*.mcr" ]; then
+					REMOTE_MCR_MTIME["$rc_system"]="$src_m"
+				elif [ "$patterns" = "*.srm *.sav *.state* *.auto" ]; then
+					REMOTE_SAVE_MTIME["$rc_system"]="$src_m"
+					REMOTE_STATE_MTIME["$rc_system"]="$src_m"
+				fi
             fi
 
         else
@@ -1102,8 +1166,155 @@ sync_dir() {
 
             system="${src##*/}"
             LOCAL_SAVE_MTIME["$system"]="$dst_m"
+			LOCAL_STATE_MTIME["$system"]="$dst_m"
         fi
     fi
+}
+
+sync_retroarch()
+{
+    local system="$1"
+    local dst="$2"
+    local save_src state_src
+    local save_m state_m
+    local dst_save_m dst_state_m
+
+    dst_save_m=$(remote_mtime "$dst" "*.srm *.sav")
+    dst_state_m=$(remote_mtime "$dst" "*.state* *.auto")
+
+    # RetroArch saves: mirror PC <-> both RA save directories.
+    for save_src in \
+        "$RA64_SAVES/$system" \
+        "$RA32_SAVES/$system"; do
+
+        [[ -d "$save_src" ]] || continue
+
+        save_m=$(local_mtime "$save_src" "*.srm *.sav")
+
+        if (( save_m > dst_save_m )); then
+            mkdir -p "$dst"
+
+            log "Syncing RetroArch saves (console->PC): $save_src"
+
+            rsync -au --no-owner --no-group \
+                --include='*.srm' \
+                --include='*.sav' \
+                --exclude='*' \
+                "$save_src/" "$dst/" >> "$LOG_FILE" 2>&1
+
+            dst_save_m="$save_m"
+            REMOTE_SAVE_MTIME["$system"]="$save_m"
+
+        elif (( dst_save_m > save_m )); then
+            mkdir -p "$save_src"
+
+            log "Syncing RetroArch saves (PC->console): $save_src"
+
+            rsync -au --no-owner --no-group \
+                --include='*.srm' \
+                --include='*.sav' \
+                --exclude='*' \
+                "$dst/" "$save_src/" >> "$LOG_FILE" 2>&1
+
+            LOCAL_SAVE_MTIME["$system"]="$dst_save_m"
+        fi
+    done
+
+    # RetroArch states: mirror PC <-> both RA state directories.
+    for state_src in \
+        "/home/ark/.config/retroarch/states/$system" \
+        "/home/ark/.config/retroarch32/states/$system"; do
+
+        [[ -d "$state_src" ]] || continue
+
+        state_m=$(local_mtime "$state_src" "*.state* *.auto")
+
+        if (( state_m > dst_state_m )); then
+            mkdir -p "$dst"
+
+            log "Syncing RetroArch states (console->PC): $state_src"
+
+            rsync -au --no-owner --no-group \
+                --include='*.state*' \
+                --include='*.auto' \
+                --exclude='*' \
+                "$state_src/" "$dst/" >> "$LOG_FILE" 2>&1
+
+            dst_state_m="$state_m"
+            REMOTE_STATE_MTIME["$system"]="$state_m"
+
+        elif (( dst_state_m > state_m )); then
+            mkdir -p "$state_src"
+
+            log "Syncing RetroArch states (PC->console): $state_src"
+
+            rsync -au --no-owner --no-group \
+                --include='*.state*' \
+                --include='*.auto' \
+                --exclude='*' \
+                "$dst/" "$state_src/" >> "$LOG_FILE" 2>&1
+
+            LOCAL_STATE_MTIME["$system"]="$dst_state_m"
+        fi
+    done
+}
+
+game_end_retroarch()
+{
+    local system="$1"
+    local dst="$2"
+    local save_src state_src
+    local save_m state_m
+
+    # One live save scan for each existing RA save source.
+    for save_src in \
+        "$RA64_SAVES/$system" \
+        "$RA32_SAVES/$system"; do
+
+        [[ -d "$save_src" ]] || continue
+
+        save_m=$(latest_mtime "$save_src" "*.srm *.sav")
+
+        mkdir -p "$dst"
+
+        log "Game-end sync (RetroArch saves): $save_src"
+
+        rsync -au --no-owner --no-group \
+            --include='*.srm' \
+            --include='*.sav' \
+            --exclude='*' \
+            "$save_src/" "$dst/" >> "$LOG_FILE" 2>&1
+
+        LOCAL_SAVE_MTIME["$system"]="$save_m"
+        REMOTE_SAVE_MTIME["$system"]="$save_m"
+
+        refresh_game_end_local_cache "$system" "$save_m" SAVE
+    done
+
+    # One live state scan for each existing RA state source.
+    for state_src in \
+        "/home/ark/.config/retroarch/states/$system" \
+        "/home/ark/.config/retroarch32/states/$system"; do
+
+        [[ -d "$state_src" ]] || continue
+
+        state_m=$(latest_mtime "$state_src" "*.state* *.auto")
+
+        mkdir -p "$dst"
+
+        log "Game-end sync (RetroArch states): $state_src"
+
+        rsync -au --no-owner --no-group \
+            --include='*.state*' \
+            --include='*.auto' \
+            --exclude='*' \
+            "$state_src/" "$dst/" >> "$LOG_FILE" 2>&1
+
+        LOCAL_STATE_MTIME["$system"]="$state_m"
+        REMOTE_STATE_MTIME["$system"]="$state_m"
+
+        refresh_game_end_local_cache "$system" "$state_m" STATE
+    done
 }
 
 game_end_sync()
@@ -1189,7 +1400,6 @@ sync_standalone()
         log "Syncing (PC->console): $src"
 
         rsync -a --update \
-            --include='*/' \
             "${rsync_opts[@]}" \
             "$dst/" "$src/" >> "$LOG_FILE" 2>&1
 
@@ -1233,7 +1443,6 @@ game_end_standalone_sync()
     log "Game-end standalone sync (console->PC): $src"
 
     if rsync -a --update \
-        --include='*/' \
         "${rsync_opts[@]}" \
         "$src/" "$dst/" >> "$LOG_FILE" 2>&1; then
 
@@ -1494,14 +1703,11 @@ SYSTEM_CACHE=()
 if [ -f "$CACHE_FILE" ]; then
 	while IFS='|' read -r type key value extra; do
 		case "$type" in
-			SYSTEM)
-				SYSTEM_CACHE["$key"]="$value" ;;
-			SAVE)
-				LOCAL_SAVE_MTIME["$key"]="$value" ;;
-			MCR)
-				LOCAL_MCR_MTIME["$key"]="$value" ;;
-			SA)
-				LOCAL_STANDALONE_MTIME["$key|$value"]="$extra" ;;
+			SYSTEM)	SYSTEM_CACHE["$key"]="$value" ;;
+			SAVE) LOCAL_SAVE_MTIME["$key"]="$value" ;;
+			STATE) LOCAL_STATE_MTIME["$key"]="$value" ;;
+			MCR) LOCAL_MCR_MTIME["$key"]="$value" ;;
+			SA)	LOCAL_STANDALONE_MTIME["$key|$value"]="$extra" ;;
 		esac
 	done < "$CACHE_FILE"
 fi
@@ -1516,6 +1722,7 @@ if [ -n "$GAME_END_SYSTEM" ] && [ -f "$FASTSYNC_FILE" ] && [ -f "$MTIME_CACHE_FI
     while IFS='|' read -r type key1 key2 val; do
         case "$type" in
             SAVE) REMOTE_SAVE_MTIME["$key1"]="$val" ;;
+            STATE) REMOTE_STATE_MTIME["$key1"]="$val" ;;
             MCR) REMOTE_MCR_MTIME["$key1"]="$val" ;;
             SA) REMOTE_STANDALONE_MTIME["$key1|$key2"]="$val" ;;
         esac
@@ -1535,41 +1742,44 @@ while IFS='|' read -r SYSTEM LOCATION RA64_ENABLED RA32_ENABLED; do
 
     [[ -v "SYSTEM_CACHE[$SYSTEM]" ]] || continue
 		
-    # Resolve console source dir
+    # Resolve console source / PC target.
     if [ "$CONTENT_MODE" = "true" ]; then
+
         [ -n "$LOCATION" ] || continue
         SRC_DIR="$LOCATION/$SYSTEM/$SYSTEM"
-    else
-        if [ "$RA64_ENABLED" = "1" ]; then
-            SRC_DIR="$RA64_SAVES/$SYSTEM"
-        elif [ "$RA32_ENABLED" = "1" ]; then
-            SRC_DIR="$RA32_SAVES/$SYSTEM"
+        DST_DIR="$MOUNT_POINT/$SYSTEM/$SYSTEM"
+
+        if [ -n "$GAME_END_SYSTEM" ]; then
+            game_end_sync "$SYSTEM" "$SRC_DIR" "$DST_DIR" SAVE "*.srm *.sav *.state* *.auto"
         else
+            sync_dir "$SRC_DIR" "$DST_DIR" "*.srm *.sav *.state* *.auto"
+        fi
+
+    else
+
+        # RetroArch keeps saves and states in separate console locations,
+        # but the PC side remains a single flat system directory.
+        DST_DIR="$MOUNT_POINT/$SYSTEM"
+
+        if [ "$RA64_ENABLED" != "1" ] && [ "$RA32_ENABLED" != "1" ]; then
             continue
         fi
-    fi
 
-    # Resolve PC target dir
-    if [ "$USECONTENTFOLDER" = "true" ]; then
-        DST_DIR="$MOUNT_POINT/$SYSTEM/$SYSTEM"
-    else
-        DST_DIR="$MOUNT_POINT/$SYSTEM"
+        if [ -n "$GAME_END_SYSTEM" ]; then
+            game_end_retroarch "$SYSTEM" "$DST_DIR"
+        else
+            sync_retroarch "$SYSTEM" "$DST_DIR"
+        fi
     fi
-
-	if [ -n "$GAME_END_SYSTEM" ]; then
-		game_end_sync "$SYSTEM" "$SRC_DIR" "$DST_DIR" SAVE "*.srm *.sav *.state* *.auto"
-		if [ -n "$LOCATION" ] && [[ " $MEDNAFEN_SYSTEMS " == *" $SYSTEM "* ]]; then
-			game_end_sync "$SYSTEM" "$LOCATION/$SYSTEM" "$MOUNT_POINT/$SYSTEM" MCR "*.mcr"
-		fi
-		continue
-	else
-		sync_dir "$SRC_DIR" "$DST_DIR" "*.srm *.sav *.state* *.auto"
-	fi
 	
-    # Mednafen save sync (.mcr, same dir as ROMs, flat mirror)
-    if [ -n "$LOCATION" ] && [[ " $MEDNAFEN_SYSTEMS " == *" $SYSTEM "* ]]; then
-        sync_standalone "$LOCATION/$SYSTEM" "*.mcr"
-    fi
+	# Mednafen save sync (.mcr, same dir as ROMs, flat mirror)
+	if [ -n "$LOCATION" ] && [[ " $MEDNAFEN_SYSTEMS " == *" $SYSTEM "* ]]; then
+		if [ -n "$GAME_END_SYSTEM" ]; then
+			game_end_standalone_sync "$LOCATION/$SYSTEM" "*.mcr"
+		else
+			sync_standalone "$LOCATION/$SYSTEM" "*.mcr"
+		fi
+	fi
 
 done < <(awk '
     /<system>/ { name=""; path=""; ra64=0; ra32=0; in_emulators=0 }
@@ -1629,19 +1839,18 @@ done
 if [ -f "$FASTSYNC_FILE" ] && [ -z "$GAME_END_SYSTEM" ]; then
     {
         printf 'DATE|%s\n' "$(date '+%Y-%m-%d')"
-
         for system in "${!SYSTEM_CACHE[@]}"; do
             printf 'SYSTEM|%s|%s\n' "$system" "${SYSTEM_CACHE[$system]}"
         done
-
         for system in "${!LOCAL_SAVE_MTIME[@]}"; do
             printf 'SAVE|%s||%s\n' "$system" "${LOCAL_SAVE_MTIME[$system]}"
         done
-
+        for system in "${!LOCAL_STATE_MTIME[@]}"; do
+            printf 'STATE|%s||%s\n' "$system" "${LOCAL_STATE_MTIME[$system]}"
+        done
         for system in "${!LOCAL_MCR_MTIME[@]}"; do
             printf 'MCR|%s||%s\n' "$system" "${LOCAL_MCR_MTIME[$system]}"
         done
-
         for key in "${!LOCAL_STANDALONE_MTIME[@]}"; do
             IFS='|' read -r path patterns <<< "$key"
 
@@ -1662,6 +1871,9 @@ if [ -f "$FASTSYNC_FILE" ]; then
         for s in "${!REMOTE_SAVE_MTIME[@]}"; do
             printf 'SAVE|%s||%s\n' "$s" "${REMOTE_SAVE_MTIME[$s]}"
         done
+        for s in "${!REMOTE_STATE_MTIME[@]}"; do
+            printf 'STATE|%s||%s\n' "$s" "${REMOTE_STATE_MTIME[$s]}"
+        done		
         for s in "${!REMOTE_MCR_MTIME[@]}"; do
             printf 'MCR|%s||%s\n' "$s" "${REMOTE_MCR_MTIME[$s]}"
         done
